@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Republish upstream Windows releases with the minimal AUTO-MAS compatibility patch."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+
+UPSTREAM = "sunyink/MFABD2"
+FORK = "Bdidnks/MFABD2"
+REVISION = 1
+API = "https://api.github.com"
+TOKEN = os.environ.get("GH_TOKEN", "")
+
+
+def api(path, data=None, method=None, missing_ok=False):
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "MFABD2-MAS-compat"}
+    if TOKEN:
+        headers["Authorization"] = "Bearer " + TOKEN
+    body = None if data is None else json.dumps(data).encode()
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(API + path, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return None if response.status == 204 else json.load(response)
+    except urllib.error.HTTPError as error:
+        if missing_ok and error.code == 404:
+            return None
+        raise RuntimeError(f"GitHub {method or 'GET'} {path}: HTTP {error.code}") from None
+
+
+def version_info(tag):
+    # Upstream's dated beta tags are not valid PEP 440, which MAS uses to discover releases.
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+)(?:\.(\d+)\.g([0-9a-f]+))?)?", tag)
+    if not match:
+        raise ValueError(f"Unsupported upstream version: {tag}")
+    major, minor, patch, beta, stamp, commit = match.groups()
+    core = f"{major}.{minor}.{patch}"
+    key = (int(major), int(minor), int(patch), beta is None, int(beta or 0), int(stamp or 0))
+    if beta is not None:
+        core += "b" + beta
+        if stamp:
+            core += ".post" + stamp
+    local = (("g" + commit + ".") if commit else "") + f"mas.{REVISION}"
+    return key, "v" + core + "+" + local
+
+
+def patch_interface(original, names, upstream_tag, fork=FORK):
+    doc = json.loads(original.decode("utf-8-sig"))
+    expected = {"python/python.exe", "agent/main.py", "agent/pc_bootstrap.py"}
+    if not expected.issubset(names):
+        raise ValueError(f"Required runtime files missing: {sorted(expected - names)}")
+    if doc.get("version") != upstream_tag:
+        raise ValueError("Package version does not match its upstream release")
+    agent = doc.get("agent")
+    if not isinstance(agent, dict) or agent.get("child_exec", "").replace("\\", "/") != "{PROJECT_DIR}/python/python.exe":
+        raise ValueError("Upstream agent layout changed; manual review required")
+    tasks = doc.get("pretask")
+    tasks = [tasks] if isinstance(tasks, dict) else tasks
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError("Upstream pretask layout changed; manual review required")
+    patched = 0
+    allowed = {"../../python/python.exe", "./python/python.exe", "python/python.exe",
+               "{PROJECT_DIR}/python/python.exe"}
+    for task in tasks:
+        if not isinstance(task, dict):
+            raise ValueError("Invalid pretask")
+        args = task.get("args", [])
+        if "pc_bootstrap.py" not in " ".join(args):
+            continue
+        if task.get("exec", "").replace("\\", "/") not in allowed:
+            raise ValueError("Unrecognized bootstrap interpreter")
+        # Retain upstream's -c bootstrap payload and all its options.
+        if "-c" not in args:
+            raise ValueError("Upstream bootstrap invocation changed; manual review required")
+        task["exec"] = "{PROJECT_DIR}/python/python.exe"
+        patched += 1
+    if not patched:
+        raise ValueError("No supported PC bootstrap pretask found")
+    doc["github"] = "https://github.com/" + fork
+    # Upstream MirrorChyan metadata/payloads must never override this fork.
+    doc.pop("mirrorchyan_rid", None)
+    doc["version"] = version_info(upstream_tag)[1]
+    return (json.dumps(doc, ensure_ascii=False, indent=4) + "\n").encode("utf-8")
+
+
+def repackage(source, target, upstream_tag):
+    with zipfile.ZipFile(source) as original:
+        entries = original.infolist()
+        paths = [PurePosixPath(e.filename) for e in entries]
+        if any(p.is_absolute() or ".." in p.parts or "\\" in e.filename or ":" in e.filename
+               for p, e in zip(paths, entries)):
+            raise ValueError("Unsafe ZIP path")
+        if len({e.filename for e in entries}) != len(entries):
+            raise ValueError("Duplicate ZIP entries")
+        interfaces = [e.filename for e in entries if e.filename == "interface.json" or e.filename.endswith("/interface.json")]
+        # Only accept a unique package root containing its interpreter.
+        roots = [name[:-len("interface.json")] for name in interfaces
+                 if name[:-len("interface.json")] + "python/python.exe" in original.namelist()]
+        if len(roots) != 1:
+            raise ValueError(f"Ambiguous package root: {roots}")
+        root = roots[0]
+        members = [e for e in entries if e.filename.startswith(root) and e.filename != root]
+        names = {e.filename[len(root):] for e in members}
+        modified = patch_interface(original.read(root + "interface.json"), names, upstream_tag)
+        with open(source, "rb") as stream:
+            source_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        provenance = {
+            "upstream": UPSTREAM, "upstreamTag": upstream_tag, "fork": FORK,
+            "revision": REVISION, "version": version_info(upstream_tag)[1],
+            "upstreamArchiveSha256": source_sha256,
+            "changes": ["pretask PC bootstrap executable", "GitHub update source",
+                        "remove upstream MirrorChyan resource ID", "PEP 440 compatibility version"],
+        }
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as output:
+            for entry in members:
+                name = entry.filename[len(root):]
+                if name == "mas-compat-provenance.json":
+                    raise ValueError("Upstream unexpectedly includes our provenance file")
+                if name == "interface.json":
+                    output.writestr(name, modified)
+                else:
+                    import copy
+                    copied = copy.copy(entry)
+                    copied.filename = name
+                    with original.open(entry) as src, output.open(copied, "w") as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 1024)
+            output.writestr("mas-compat-provenance.json", json.dumps(provenance, indent=2) + "\n")
+    with zipfile.ZipFile(target) as output:
+        bad = output.testzip()
+        if bad:
+            raise ValueError(f"Output ZIP CRC failure: {bad}")
+        result = json.loads(output.read("interface.json"))
+        assert result["github"] == "https://github.com/" + FORK
+        assert "mirrorchyan_rid" not in result
+    return provenance
+
+
+def disable_inherited_workflows():
+    workflows = api(f"/repos/{FORK}/actions/workflows?per_page=100")["workflows"]
+    for workflow in workflows:
+        if workflow["path"] != ".github/workflows/mas-compat.yml" and workflow["state"] == "active":
+            api(f"/repos/{FORK}/actions/workflows/{workflow['id']}/disable", method="PUT")
+            print("Disabled inherited workflow:", workflow["path"])
+
+
+def sync_upstream_branch():
+    source = api(f"/repos/{UPSTREAM}/git/ref/heads/main")["object"]["sha"]
+    path = f"/repos/{FORK}/git/refs/heads/upstream-main"
+    current = api(f"/repos/{FORK}/git/ref/heads/upstream-main", missing_ok=True)
+    if current is None:
+        api(f"/repos/{FORK}/git/refs", {"ref": "refs/heads/upstream-main", "sha": source})
+    elif current["object"]["sha"] != source:
+        api(path, {"sha": source, "force": False}, method="PATCH")
+    print("Upstream source snapshot:", source)
+
+
+def upload_asset(release, name, file):
+    url = release["upload_url"].split("{")[0] + "?name=" + urllib.parse.quote(name)
+    size = file.stat().st_size
+    headers = {"Authorization": "Bearer " + TOKEN, "Content-Type": "application/zip",
+               "Content-Length": str(size), "User-Agent": "MFABD2-MAS-compat"}
+    with file.open("rb") as stream:
+        request = urllib.request.Request(url, data=stream, headers=headers, method="POST")
+        with urllib.request.urlopen(request, timeout=900) as response:
+            return json.load(response)
+
+
+def sync_release(upstream, workdir):
+    tag = upstream["tag_name"]
+    target_tag = version_info(tag)[1]
+    asset_name = f"MFABD2-{target_tag}-win-x86_64.zip"
+    assets = [a for a in upstream["assets"] if a["name"].endswith("-win-x86_64.zip")]
+    if len(assets) != 1:
+        raise ValueError(f"{tag}: expected one Windows x64 complete ZIP")
+    path = f"/repos/{FORK}/releases/tags/{urllib.parse.quote(target_tag, safe='')}"
+    release = api(path, missing_ok=True)
+    if release and not release["draft"]:
+        if any(a["name"] == asset_name for a in release["assets"]):
+            print("Already published:", target_tag)
+            return
+        raise ValueError(f"Published release is missing its package: {target_tag}")
+    source = workdir / (tag + ".zip")
+    target = workdir / asset_name
+    print("Downloading", assets[0]["browser_download_url"], flush=True)
+    request = urllib.request.Request(assets[0]["browser_download_url"], headers={"User-Agent": "MFABD2-MAS-compat"})
+    with urllib.request.urlopen(request, timeout=900) as response, source.open("wb") as dst:
+        shutil.copyfileobj(response, dst, 1024 * 1024)
+    if source.stat().st_size != assets[0]["size"]:
+        raise ValueError("Download size mismatch")
+    digest = assets[0].get("digest") or ""
+    if digest.startswith("sha256:"):
+        with source.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != digest[7:]:
+                raise ValueError("Upstream asset SHA256 mismatch")
+    provenance = repackage(source, target, tag)
+    with target.open("rb") as stream:
+        sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    body = (f"AUTO-MAS compatible Windows x64 package, based on [{tag}]({upstream['html_url']}).\n\n"
+            "Original game logic and dependencies are retained. Changes: project-relative PC pretask "
+            "interpreter, fork update source, removal of upstream MirrorChyan ID, and normalized version.\n\n"
+            f"Compatibility revision: {REVISION}\n\nSHA256: {sha}\n\n"
+            f"Upstream archive SHA256: {provenance['upstreamArchiveSha256']}\n")
+    if not release:
+        release = api(f"/repos/{FORK}/releases", {
+            "tag_name": target_tag, "target_commitish": os.environ.get("GITHUB_SHA", "main"),
+            "name": f"{tag} / AUTO-MAS r{REVISION}", "body": body,
+            "draft": True, "prerelease": bool(upstream["prerelease"]),
+        })
+    existing = [a for a in release["assets"] if a["name"] == asset_name]
+    if existing:
+        if existing[0]["size"] != target.stat().st_size:
+            raise ValueError("Draft asset differs; manual cleanup required")
+    else:
+        upload_asset(release, asset_name, target)
+    api(f"/repos/{FORK}/releases/{release['id']}", {
+        "draft": False, "body": body, "prerelease": bool(upstream["prerelease"]),
+        "make_latest": "false" if upstream["prerelease"] else "true",
+    }, method="PATCH")
+    print("Published:", target_tag, flush=True)
+    source.unlink()
+    target.unlink()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--tag")
+    args = parser.parse_args()
+    if args.source:
+        if not args.output or not args.tag:
+            parser.error("--source requires --output and --tag")
+        print(json.dumps(repackage(args.source, args.output, args.tag), indent=2))
+        return
+    if os.environ.get("GITHUB_REPOSITORY") != FORK or not TOKEN:
+        raise RuntimeError("Publishing is restricted to the configured fork with GH_TOKEN")
+    disable_inherited_workflows()
+    sync_upstream_branch()
+    stable = api(f"/repos/{UPSTREAM}/releases/latest")
+    recent = api(f"/repos/{UPSTREAM}/releases?per_page=30")
+    supported = []
+    for release in recent:
+        if release["draft"]:
+            continue
+        try:
+            key, _ = version_info(release["tag_name"])
+        except ValueError:
+            continue
+        supported.append((key, release))
+    selected = {stable["tag_name"]: stable}
+    if supported:
+        newest = max(supported, key=lambda pair: pair[0])[1]
+        selected[newest["tag_name"]] = newest
+    with tempfile.TemporaryDirectory(prefix="mfabd2-mas-") as temporary:
+        for release in sorted(selected.values(), key=lambda r: version_info(r["tag_name"])[0]):
+            sync_release(release, Path(temporary))
+
+
+if __name__ == "__main__":
+    main()
