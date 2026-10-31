@@ -1,0 +1,29 @@
+name: AUTO-MAS compatible releases
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mas-compat.yml'
+      - 'mas_compat/**'
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: mas-compatible-release
+  cancel-in-progress: false
+jobs:
+  republish:
+    if: github.repository == 'Bdidnks/MFABD2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          sparse-checkout: mas_compat
+      - name: Sync upstream snapshot and publish compatible packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 mas_compat/release_sync
