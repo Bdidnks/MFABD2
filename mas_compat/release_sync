@@ -12,10 +12,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from account_compat import adapt_interface, gate_pipeline, patch_account_sync, GATE_FILE
 
 UPSTREAM = "sunyink/MFABD2"
 FORK = "Bdidnks/MFABD2"
-REVISION = 1
+REVISION = 2
 API = "https://api.github.com"
 TOKEN = os.environ.get("GH_TOKEN", "")
 
@@ -89,6 +90,7 @@ def patch_interface(original, names, upstream_tag, fork=FORK):
     # Upstream MirrorChyan metadata/payloads must never override this fork.
     doc.pop("mirrorchyan_rid", None)
     doc["version"] = version_info(upstream_tag)[1]
+    doc = adapt_interface(doc)
     return (json.dumps(doc, ensure_ascii=False, indent=4) + "\n").encode("utf-8")
 
 
@@ -111,6 +113,9 @@ def repackage(source, target, upstream_tag):
         members = [e for e in entries if e.filename.startswith(root) and e.filename != root]
         names = {e.filename[len(root):] for e in members}
         modified = patch_interface(original.read(root + "interface.json"), names, upstream_tag)
+        if GATE_FILE in names:
+            raise ValueError("Upstream already includes our account gate file")
+        gates = gate_pipeline(json.loads(modified))
         with open(source, "rb") as stream:
             source_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
         provenance = {
@@ -118,7 +123,8 @@ def repackage(source, target, upstream_tag):
             "revision": REVISION, "version": version_info(upstream_tag)[1],
             "upstreamArchiveSha256": source_sha256,
             "changes": ["pretask PC bootstrap executable", "GitHub update source",
-                        "remove upstream MirrorChyan resource ID", "PEP 440 compatibility version"],
+                        "remove upstream MirrorChyan resource ID", "PEP 440 compatibility version",
+                        "global account option injection and truthful account guard failures"],
         }
         with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as output:
             for entry in members:
@@ -127,12 +133,15 @@ def repackage(source, target, upstream_tag):
                     raise ValueError("Upstream unexpectedly includes our provenance file")
                 if name == "interface.json":
                     output.writestr(name, modified)
+                elif name == "agent/utils/account_sync.py":
+                    output.writestr(name, patch_account_sync(original.read(entry)))
                 else:
                     import copy
                     copied = copy.copy(entry)
                     copied.filename = name
                     with original.open(entry) as src, output.open(copied, "w") as dst:
                         shutil.copyfileobj(src, dst, 1024 * 1024)
+            output.writestr(GATE_FILE, gates)
             output.writestr("mas-compat-provenance.json", json.dumps(provenance, indent=2) + "\n")
     with zipfile.ZipFile(target) as output:
         bad = output.testzip()
@@ -206,7 +215,7 @@ def sync_release(upstream, workdir):
         sha = hashlib.file_digest(stream, "sha256").hexdigest()
     body = (f"AUTO-MAS compatible Windows x64 package, based on [{tag}]({upstream['html_url']}).\n\n"
             "Original game logic and dependencies are retained. Changes: project-relative PC pretask "
-            "interpreter, fork update source, removal of upstream MirrorChyan ID, and normalized version.\n\n"
+            "interpreter, fork update source, removal of upstream MirrorChyan ID, normalized version, global account injection, and accurate account-guard failure results.\n\n"
             f"Compatibility revision: {REVISION}\n\nSHA256: {sha}\n\n"
             f"Upstream archive SHA256: {provenance['upstreamArchiveSha256']}\n")
     if not release:
