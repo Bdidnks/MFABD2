@@ -35,7 +35,13 @@ def api(path, data=None, method=None, missing_ok=False):
     except urllib.error.HTTPError as error:
         if missing_ok and error.code == 404:
             return None
-        raise RuntimeError(f"GitHub {method or 'GET'} {path}: HTTP {error.code}") from None
+        try:
+            detail = str(json.load(error).get("message", ""))
+        except (ValueError, AttributeError):
+            detail = ""
+        if TOKEN:
+            detail = detail.replace(TOKEN, "[redacted]")
+        raise RuntimeError(f"GitHub {method or 'GET'} {path}: HTTP {error.code}: {detail[:1000]}") from None
 
 
 def version_info(tag):
