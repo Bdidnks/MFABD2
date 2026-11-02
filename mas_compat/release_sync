@@ -253,7 +253,10 @@ def main():
     if os.environ.get("GITHUB_REPOSITORY") != FORK or not TOKEN:
         raise RuntimeError("Publishing is restricted to the configured fork with GH_TOKEN")
     disable_inherited_workflows()
-    sync_upstream_branch()
+    try:
+        sync_upstream_branch()
+    except RuntimeError as error:
+        print(f"::warning::Upstream mirror sync failed; release checks will continue: {error}", flush=True)
     stable = api(f"/repos/{UPSTREAM}/releases/latest")
     recent = api(f"/repos/{UPSTREAM}/releases?per_page=30")
     supported = []
